@@ -3,23 +3,24 @@
 [Claude Code](https://claude.com/claude-code) のステータスライン用スクリプト。画面下部に次を1行で常時表示します。
 
 ```
-~/my-project │ 5h枠 ▓▓░░░░░░ 26% │ 週枠 ▓░░░░░░░ 14% │ Opus 4.7 · 文脈 57/60% · 累計$7.47
+~/my-project │ 5h枠 ▓▓░░░░░░ 26%→16:00 │ 週枠 ▓░░░░░░░ 14%→7/10 │ Max 20x · Opus 4.7 · 文脈 15/60% · 累計$7.47
 ```
 
 | 区画 | 意味 |
 |---|---|
 | `~/my-project` | 現在の作業ディレクトリ。ホームは `~` に短縮、40文字を超える場合は中間ディレクトリを頭文字1字に省略（`~/p/s/src` のように末尾だけ残す） |
-| `5h枠` | 5時間ローリングウィンドウのレート制限消費率（カラー付きバー。50%〜シアン / 70%〜黄 / 90%〜赤） |
-| `週枠` | 7日ウィンドウのレート制限消費率 |
+| `5h枠` | 5時間ローリングウィンドウのレート制限消費率（カラー付きバー。50%〜シアン / 70%〜黄 / 90%〜赤）。`→16:00` はリセット時刻 |
+| `週枠` | 7日ウィンドウのレート制限消費率。`→7/10` はリセット日 |
+| `Max 20x` | サブスクプラン名（Pro / Max 5x / Max 20x 等。取得できた時のみ） |
 | `Opus 4.7` | 現在使用中のモデル名 |
-| `文脈 57/60%` | コンテキスト窓の使用率。`/60%` は autocompact（自動要約）の発火ライン（`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 設定時のみ表示） |
+| `文脈 15/60%` | コンテキスト窓の使用率。`/60%` は autocompact（自動要約）の発火ライン（`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 設定時のみ表示） |
 | `累計$7.47` | セッション累計コストの API 料金換算参考値（サブスクリプション利用時は実請求ではない） |
 
 取得できない項目は区画ごと省略されるため、古いバージョンの Claude Code でも動作します。
 
 ## 必要環境
 
-- Python 3.10+（標準ライブラリのみ。追加インストール不要）
+- Python 3.9+（標準ライブラリのみ。追加インストール不要。macOS 標準の python3 で動作）
 
 ## セットアップ
 
@@ -50,9 +51,12 @@ autocompact の発火ラインを併記したい場合（任意）:
 
 ## 実装メモ
 
-- Claude Code は statusLine コマンドの stdin に毎回セッション情報の JSON を渡す。本スクリプトは `workspace.current_dir` / `model` / `cost.total_cost_usd` / `transcript_path` / `rate_limits` を参照する
-- コンテキスト使用率は stdin では渡されないため、`transcript_path` の JSONL を走査して直近の usage レコード（input + cache_read + cache_creation トークン）から推定する。窓サイズはモデル ID に `[1m]` を含めば 100 万、それ以外は 20 万トークン
-- autocompact 閾値は環境変数 → `~/.claude/settings.json` の `env` の順で読む
+- Claude Code は statusLine コマンドの stdin に毎回セッション情報の JSON を渡す。本スクリプトは `workspace.current_dir` / `model` / `cost.total_cost_usd` / `context_window` / `rate_limits`（`used_percentage` と `resets_at`）を参照する
+- コンテキスト使用率は `context_window.used_percentage`（v2 系で提供）をそのまま使う。無い旧バージョンでは `transcript_path` の JSONL を走査して直近の usage レコードから推定にフォールバック
+- サブスクプラン名だけは stdin に来ないため、`~/.claude.json` の `oauthAccount`（ログイン時にキャッシュされる非公開フィールド）から読む。構造が変わって取れない場合は黙って省略
+- autocompact 閾値は環境変数 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` → `~/.claude/settings.json` の `env` の順で読む。「文脈」の色は閾値に対する比率で付く（閾値60で57%ならほぼ満杯＝赤）
+- `~/.claude.json` は履歴等で数MBになりうるため、プラン名の解析結果を `~/.claude/statusline-plan.cache` に元ファイルの mtime 付きでキャッシュし、毎レンダリングの全パースを避けている
+- 取得できない項目は区画ごと省略する方針のため、フィールド構成が違う環境でも1行は必ず出る（想定外の入力・型でも落ちないよう型検証と最終フォールバックを備える）
 
 ## License
 

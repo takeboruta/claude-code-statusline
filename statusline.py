@@ -8,9 +8,10 @@ Claude Code statusLine スクリプト
   - サブスクプラン名 / 現在のモデル名
     / 文脈: コンテキスト窓の使用率（/以降は autocompact 発火ライン）
     / 累計: セッションの API 料金換算参考コスト
+    / ⚒N: 実行中のサブエージェント数（動いている時のみ表示）
 
 表示例:
-  ~/my-project │ 5h枠 ▓▓▓░░░░░ 42%→16:00 │ 週枠 ▓▓▓▓▓▓▓░ 86%→7/10 │ Max 20x · Opus 4.7 · 文脈 38/60% · 累計$1.24
+  ~/my-project │ 5h枠 ▓▓▓░░░░░ 42% → 16:00 │ 週枠 ▓▓▓▓▓▓▓░ 86% → 7/10 │ Max 20x · Opus 4.7 · 文脈 38/60% · 累計$1.24
 
 Claude Code は statusLine コマンドの stdin に毎回 JSON を渡す。本スクリプトが参照する主なフィールド:
   {
@@ -36,11 +37,13 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 
 BAR_WIDTH = 8       # プログレスバーの目盛り数（▓ と ░ の合計）
 DIR_MAX_LEN = 40    # 作業ディレクトリ表示がこれを超えたら中間を頭文字1字に省略
 RESET = "\033[0m"   # 色指定を打ち消す ANSI リセット
+AGENT_ACTIVE_SEC = 30  # subagent transcript の mtime がこの秒数以内なら「実行中」とみなす
 
 # ~/.claude.json は履歴等で数MBになりうるため、毎レンダリング（数百ms間隔）の
 # 全パースを避けて「元ファイルの mtime + 解析結果」を小さなキャッシュに残す
@@ -79,11 +82,11 @@ def color_for(pct: float) -> str:
 
 def format_section(label: str, pct: float | None, reset: str | None = None) -> str:
     """
-    レート制限の 1 区画（"5h枠: ▓▓▓░░░░░ 42%→16:00" 等）を組み立てる。
-    使用率が無くてもリセット時刻が取れていれば「N/A→16:00」として残す
+    レート制限の 1 区画（"5h枠: ▓▓▓░░░░░ 42% → 16:00" 等）を組み立てる。
+    使用率が無くてもリセット時刻が取れていれば「N/A → 16:00」として残す
     （制限に当たっている時こそ復活時刻が要る情報のため）。
     """
-    tail = f"→{reset}" if reset else ""
+    tail = f" → {reset}" if reset else ""
     if pct is None:
         return f"{label}: N/A{tail}"
     return f"{label}: {color_for(pct)}{make_bar(pct)} {pct:3.0f}%{RESET}{tail}"
@@ -272,6 +275,38 @@ def plan_name() -> str | None:
     return plan
 
 
+def active_agents(data: dict) -> int:
+    """
+    実行中のサブエージェント数を数える。
+
+    Claude Code は statusLine の stdin にサブエージェント情報を渡さないため、
+    セッション transcript の隣（<transcript と同名のディレクトリ>/subagents/）に
+    作られる agent-*.jsonl を見る。実行中のエージェントは数秒おきにここへ追記
+    するので、mtime が AGENT_ACTIVE_SEC 以内のファイル数 ≒ 実行中の数とみなす
+    （長いツール実行中は書き込みが止まり一時的に数え漏れる可能性はある）。
+    ディレクトリが無い・読めない場合は 0（区画ごと省略）。
+    """
+    path = data.get("transcript_path")
+    if not isinstance(path, str) or not path.endswith(".jsonl"):
+        return 0
+    subagents_dir = os.path.join(path[: -len(".jsonl")], "subagents")
+    count = 0
+    now = time.time()
+    try:
+        with os.scandir(subagents_dir) as entries:
+            for e in entries:
+                if not e.name.startswith("agent-") or not e.name.endswith(".jsonl"):
+                    continue
+                try:
+                    if now - e.stat().st_mtime <= AGENT_ACTIVE_SEC:
+                        count += 1
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return count
+
+
 def format_meta(data: dict) -> str | None:
     """
     右側の付加情報「プラン · モデル名 · 文脈 NN/60% · 累計$x.xx」を組み立てる。
@@ -307,6 +342,11 @@ def format_meta(data: dict) -> str | None:
     cost = num(cost_obj.get("total_cost_usd")) if isinstance(cost_obj, dict) else None
     if cost is not None:
         parts.append(f"累計${cost:.2f}")
+
+    # 実行中サブエージェント数（0 の時は区画ごと出さない）
+    agents = active_agents(data)
+    if agents:
+        parts.append(f"\033[35m⚒{agents}{RESET}")  # マゼンタ: 他区画と被らない配色
 
     return " · ".join(parts) if parts else None
 

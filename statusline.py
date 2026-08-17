@@ -34,16 +34,21 @@ Claude Code は statusLine コマンドの stdin に毎回 JSON を渡す。本�
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import stat
 import sys
 import time
+import unicodedata
 from datetime import datetime
 
 BAR_WIDTH = 8       # プログレスバーの目盛り数（▓ と ░ の合計）
 DIR_MAX_LEN = 40    # 作業ディレクトリ表示がこれを超えたら中間を頭文字1字に省略
+DIR_ELLIPSIS = "…"  # 末尾コンポーネントを切り詰めた際に付ける印
 RESET = "\033[0m"   # 色指定を打ち消す ANSI リセット
 AGENT_ACTIVE_SEC = 30  # subagent transcript の mtime がこの秒数以内なら「実行中」とみなす
+CONTEXT_SCAN_MAX_BYTES = 2_000_000  # context_window が無い旧版向けフォールバックで transcript 末尾から読む上限バイト数
 
 # ~/.claude.json は履歴等で数MBになりうるため、毎レンダリング（数百ms間隔）の
 # 全パースを避けて「元ファイルの mtime + 解析結果」を小さなキャッシュに残す
@@ -51,9 +56,15 @@ PLAN_CACHE_PATH = os.path.expanduser("~/.claude/statusline-plan.cache")
 
 
 def num(v: object) -> float | None:
-    """JSON 由来の値を数値として検証する。bool は int の派生なので明示的に弾く。"""
+    """
+    JSON 由来の値を数値として検証する。bool は int の派生なので明示的に弾く。
+    NaN / ±Infinity も弾く（Python の json モジュールは既定でこれらのリテラルを
+    受理してしまうため、round() 等の呼び出し側が例外を投げる前にここで遮断する。
+    これにより make_bar() に限らず num() を通す全経路が守られる）。
+    """
     if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return float(v)
+        f = float(v)
+        return f if math.isfinite(f) else None
     return None
 
 
@@ -113,6 +124,49 @@ def format_reset(ts: object, weekly: bool = False) -> str | None:
     return f"{dt.hour:02d}:{dt.minute:02d}"
 
 
+def _is_regional_indicator(ch: str) -> bool:
+    """国旗絵文字を構成する「地域指示記号」(🇦〜🇿 相当)かどうか。"""
+    return 0x1F1E6 <= ord(ch) <= 0x1F1FF
+
+
+def _shrink_component(p: str) -> str:
+    """
+    中間ディレクトリ名を先頭1文字に縮める（fish 風の省略）。
+
+    国旗絵文字（地域指示記号2つの組）等、複数コードポイントで1つの見た目を
+    構成する文字の先頭1コードポイントだけを取り出すと、単体では意味をなさない
+    半端な文字が残ってしまう（例: "🇯🇵🇰🇷🇺🇸-project"[:1] → "🇯" だけになる）。
+    標準ライブラリだけで正確なグラフェムクラスタ境界を判定するのは困難なため、
+    先頭文字が ASCII 範囲外の場合は「安全側」として省略せず元の文字列を
+    そのまま残す、という実用的な対処にとどめる（完璧な絵文字対応は目指さない）。
+    """
+    if not p or ord(p[0]) > 127:
+        return p
+    return p[:1]
+
+
+def _truncate_safe(s: str, budget: int) -> str:
+    """
+    s を最大 budget 文字に切り詰める（末尾コンポーネント強制省略用）。
+
+    グラフェムクラスタの完全な判定はしないが、実用上よくある2パターンだけ
+    追加でケアする: (1) 切断点の直後が結合文字（アクセント記号等）の場合、
+    (2) 国旗絵文字の地域指示記号ペアを半分だけ残してしまう場合。
+    どちらも切断点を1文字前にずらし、明らかに半端な文字が残るのを避ける。
+    """
+    if budget <= 0:
+        return ""
+    cut = s[:budget]
+    if not cut:
+        return cut
+    rest_first = s[budget] if budget < len(s) else ""
+    if rest_first and unicodedata.combining(rest_first):
+        cut = cut[:-1]
+    elif _is_regional_indicator(cut[-1]) and rest_first and _is_regional_indicator(rest_first):
+        cut = cut[:-1]
+    return cut
+
+
 def format_dir(data: dict) -> str | None:
     """
     作業ディレクトリの区画を組み立てる。
@@ -120,6 +174,9 @@ def format_dir(data: dict) -> str | None:
     パスは workspace.current_dir（cd 追従後の現在地）を優先し、無ければ cwd。
     ホームは ~ に短縮し、DIR_MAX_LEN を超える場合は fish 風に中間ディレクトリを
     頭文字1字へ省略する（例: ~/p/my-project/src のように末尾だけ残す）。
+    それでも DIR_MAX_LEN を超える場合（現実にはプロジェクト名・ブランチ名など
+    末尾コンポーネントが長いケースが最頻出）は、末尾コンポーネントも "…" 付きで
+    切り詰めて必ず DIR_MAX_LEN に収める。
     どちらのフィールドも取れなければ None を返し、区画ごと省略する。
     """
     ws = data.get("workspace")
@@ -135,10 +192,24 @@ def format_dir(data: dict) -> str | None:
     if len(path) > DIR_MAX_LEN:
         parts = path.split("/")
         # 先頭（~ や空文字）と末尾は残し、中間だけ頭文字に縮める
-        path = "/".join(
-            p if i in (0, len(parts) - 1) else (p[:1] or p)
+        parts = [
+            p if i in (0, len(parts) - 1) else _shrink_component(p)
             for i, p in enumerate(parts)
-        )
+        ]
+        path = "/".join(parts)
+        if len(path) > DIR_MAX_LEN:
+            # 中間省略だけでは収まらない（＝末尾コンポーネントが長い）。
+            # 末尾も切り詰めて必ず DIR_MAX_LEN に収める。
+            prefix = "/".join(parts[:-1])
+            sep = 1 if prefix else 0
+            budget = DIR_MAX_LEN - len(prefix) - sep - len(DIR_ELLIPSIS)
+            if budget < 1:
+                # 中間部だけで予算を使い切る極端なケース。全体を素朴に切り詰める
+                # （体裁より「1行に必ず収める」契約を優先する）。
+                path = _truncate_safe(path, max(0, DIR_MAX_LEN - len(DIR_ELLIPSIS))) + DIR_ELLIPSIS
+            else:
+                tail = _truncate_safe(parts[-1], budget)
+                path = (prefix + "/" if prefix else "") + tail + DIR_ELLIPSIS
     return f"\033[34m{path}{RESET}"  # 青: 使用率バーの警戒色と混ざらない配色
 
 
@@ -165,24 +236,53 @@ def context_pct(data: dict) -> float | None:
     model = data.get("model")
     model_id = model.get("id") if isinstance(model, dict) else None
     window = 1_000_000 if isinstance(model_id, str) and "[1m]" in model_id else 200_000
+
+    # 通常ファイルであることを先に確認する。transcript_path に名前付きパイプ
+    # (FIFO) 等が渡ると open() が書き手待ちでブロックし、タイムアウトが無いため
+    # 復帰しない（5秒ごとに呼ばれるのでプロセスが積み上がる）。stat() 自体は
+    # ブロックしないのでここで安全に弾ける。
     try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+
+    try:
+        # 巨大 transcript の全文走査を避けるため、末尾 CONTEXT_SCAN_MAX_BYTES
+        # バイトだけを読む（この経路が探すのは「最後に現れた usage レコード」
+        # なので末尾から読むのが自然）。バイナリで読んで errors="replace" で
+        # デコードすることで、非UTF-8内容や途中バイトでのシーク開始があっても
+        # UnicodeDecodeError で全区画が消えることがないようにする。
+        with open(path, "rb") as f:
+            size = st.st_size
+            truncated = size > CONTEXT_SCAN_MAX_BYTES
+            if truncated:
+                f.seek(size - CONTEXT_SCAN_MAX_BYTES)
+            chunk = f.read()
+        text = chunk.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        if truncated:
+            # シーク位置は行の途中である可能性が高く、先頭行は不完全なため捨てる
+            # （直近の usage を知りたいだけなので影響しない）。
+            lines = lines[1:]
+
         last_usage = None
-        # JSONL を順に走査し、usage を持つ最後のレコードを保持する（=直近の文脈量）
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue  # 壊れた行はスキップ
-                if not isinstance(rec, dict):
-                    continue
-                msg = rec.get("message")
-                usage = msg.get("usage") if isinstance(msg, dict) else None
-                if isinstance(usage, dict):
-                    last_usage = usage
+        # 順に走査し、usage を持つ最後のレコードを保持する（=直近の文脈量）
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue  # 壊れた行はスキップ
+            if not isinstance(rec, dict):
+                continue
+            msg = rec.get("message")
+            usage = msg.get("usage") if isinstance(msg, dict) else None
+            if isinstance(usage, dict):
+                last_usage = usage
         if not last_usage:
             return None
         # キャッシュ読み書きを含む全入力トークンが「窓を埋めている量」

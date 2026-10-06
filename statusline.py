@@ -33,6 +33,7 @@ Claude Code は statusLine コマンドの stdin に毎回 JSON を渡す。本�
 # macOS 標準の python3（3.9）でも def 時に型注釈が評価されて落ちないようにする
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -53,6 +54,16 @@ CONTEXT_SCAN_MAX_BYTES = 2_000_000  # context_window が無い旧版向けフォ
 # ~/.claude.json は履歴等で数MBになりうるため、毎レンダリング（数百ms間隔）の
 # 全パースを避けて「元ファイルの mtime + 解析結果」を小さなキャッシュに残す
 PLAN_CACHE_PATH = os.path.expanduser("~/.claude/statusline-plan.cache")
+
+# codex（OpenAI の CLI）の枠。Claude の枠は Claude Code が stdin の JSON で渡して
+# くれるが、codex は別サービスの別プロセスなので誰も渡してくれない。
+# ~/.codex/sessions の最新セッションに残る rate_limits から読む。
+# statusLine は短い間隔で繰り返し呼ばれるため、結果を短時間キャッシュし、
+# 探索も mtime の新しい数本に限る。codex を使っていなければ区画ごと出さない。
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+CODEX_CACHE_PATH = os.path.expanduser("~/.claude/statusline-codex.cache")
+CODEX_CACHE_TTL = 120   # 秒。枠は分単位でしか動かないので、これで十分新しい。
+CODEX_SCAN_FILES = 10   # mtime の新しい順に見るファイル数
 
 
 def num(v: object) -> float | None:
@@ -451,6 +462,82 @@ def format_meta(data: dict) -> str | None:
     return " · ".join(parts) if parts else None
 
 
+def codex_limits() -> dict | None:
+    """codex の枠（used_percent / window_minutes / resets_at）を返す。失敗時は None。
+
+    ~/.codex が無い環境（codex を使っていない）では毎回 None になる。
+    その場合もキャッシュに None を書き、無駄な探索を繰り返さない。
+    """
+    now = time.time()
+    try:
+        with open(CODEX_CACHE_PATH, encoding="utf-8") as fh:
+            c = json.load(fh)
+        if isinstance(c, dict) and now - c.get("at", 0) < CODEX_CACHE_TTL:
+            return c.get("rl")
+    except (OSError, ValueError):
+        pass
+
+    rl = None
+    try:
+        files = glob.glob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True)
+        files.sort(key=os.path.getmtime, reverse=True)
+        for path in files[:CODEX_SCAN_FILES]:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if '"rate_limits"' not in line:
+                            continue
+                        try:
+                            got = (json.loads(line).get("payload") or {}).get("rate_limits")
+                        except ValueError:
+                            continue
+                        if got:
+                            rl = got      # 同一ファイル内の最後＝最新
+            except OSError:
+                continue
+            if rl:
+                break
+    except OSError:
+        rl = None
+
+    try:
+        os.makedirs(os.path.dirname(CODEX_CACHE_PATH), exist_ok=True)
+        with open(CODEX_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"at": now, "rl": rl}, fh)
+    except OSError:
+        pass
+    return rl
+
+
+def format_codex(rl: object) -> str | None:
+    """codex の枠を Claude の枠と同じ見た目の1区画にする。読めなければ出さない。
+
+    バーも配色も format_section に委ねる。codex だけ別の見た目にすると、
+    同じ行に並んだときに「どちらが重いか」を目で比べられなくなる。
+    codex を使っていない日も記録は残り続けるので、古い値を今の値のように
+    見せないようリセット時刻を必ず添える。
+    """
+    if not isinstance(rl, dict):
+        return None
+    pr = rl.get("primary")
+    if not isinstance(pr, dict):
+        return None
+    pct = num(pr.get("used_percent"))
+    if pct is None:
+        return None
+    win = pr.get("window_minutes")
+    label = "codex週" if win == 10080 else ("codex日" if win == 1440 else "codex")
+    reset = num(pr.get("resets_at"))
+    tail = None
+    if reset is not None:
+        try:
+            d = datetime.fromtimestamp(reset)
+            tail = f"{d:%-m/%-d}" if win == 10080 else f"{d:%H:%M}"
+        except (OverflowError, OSError, ValueError):
+            tail = None
+    return format_section(label, pct, tail)
+
+
 def render() -> str:
     """stdin の JSON を読み、ステータスライン1行分の文字列を組み立てる。"""
     try:
@@ -480,6 +567,9 @@ def render() -> str:
         format_section("週枠", num(rl_7d.get("used_percentage")),
                        format_reset(rl_7d.get("resets_at"), weekly=True)),
     ]
+    codex_section = format_codex(codex_limits())
+    if codex_section:
+        sections.append(codex_section)
     meta = format_meta(data)
     if meta:
         sections.append(meta)

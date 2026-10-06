@@ -45,6 +45,13 @@ import unicodedata
 from datetime import datetime
 
 BAR_WIDTH = 8       # プログレスバーの目盛り数（▓ と ░ の合計）
+
+# 枠の使用率のしきい値。バーを出さないので、色を見落としても気づけるよう
+# 記号も付ける（警告 "!" / アラート "!!"）。環境変数で動かせる。
+WARN_PCT = float(os.environ.get("STATUSLINE_WARN_PCT", "80"))    # 警告
+ALERT_PCT = float(os.environ.get("STATUSLINE_ALERT_PCT", "90"))  # アラート
+WARN_MARK = "!"
+ALERT_MARK = "!!"
 DIR_MAX_LEN = 40    # 作業ディレクトリ表示がこれを超えたら中間を頭文字1字に省略
 DIR_ELLIPSIS = "…"  # 末尾コンポーネントを切り詰めた際に付ける印
 RESET = "\033[0m"   # 色指定を打ち消す ANSI リセット
@@ -92,26 +99,45 @@ def make_bar(pct: float) -> str:
 
 def color_for(pct: float) -> str:
     """使用率に応じた ANSI カラーのエスケープを返す（高いほど警戒色）。"""
-    if pct >= 90:
-        return "\033[31m"   # 赤: 危険域
-    elif pct >= 70:
-        return "\033[33m"   # 黄: 注意
+    if pct >= ALERT_PCT:
+        return "\033[31m"   # 赤: アラート
+    elif pct >= WARN_PCT:
+        return "\033[33m"   # 黄: 警告
     elif pct >= 50:
-        return "\033[36m"   # シアン: 中程度
+        return "\033[36m"   # シアン: 半分超え（警告ではない）
     else:
         return "\033[32m"   # 緑: 余裕
 
 
+def mark_for(pct: float) -> str:
+    """しきい値を超えたときに付ける記号を返す。
+
+    色だけだと、端末の配色・色覚・視野の端で見落とす。バーを外して塗りの
+    長さという手がかりも無くなったので、文字でも分かるようにする。
+    """
+    if pct >= ALERT_PCT:
+        return ALERT_MARK
+    if pct >= WARN_PCT:
+        return WARN_MARK
+    return ""
+
+
 def format_section(label: str, pct: float | None, reset: str | None = None) -> str:
     """
-    レート制限の 1 区画（"5h枠: ▓▓▓░░░░░ 42% → 16:00" 等）を組み立てる。
+    レート制限の 1 区画（"5h枠 42%→16:00" 等）を組み立てる。
+
+    **バーは出さない。** 危険度は色（50%〜シアン / 70%〜黄 / 90%〜赤）が、量は
+    数字が表しており、隣り合うバーは同じことを二度言っている。枠が3つ並ぶと
+    バーだけで 24 桁、飾りの空白で 15 桁を使い、狭い端末で右端が切れる。
+    周辺視野で塗りの長さを見たい場合は make_bar() を差し戻せばよい（1行）。
+    % を桁揃えしていないので、9% → 10% で右が1桁ずれる。
     使用率が無くてもリセット時刻が取れていれば「N/A → 16:00」として残す
     （制限に当たっている時こそ復活時刻が要る情報のため）。
     """
-    tail = f" → {reset}" if reset else ""
+    tail = f"→{reset}" if reset else ""
     if pct is None:
-        return f"{label}: N/A{tail}"
-    return f"{label}: {color_for(pct)}{make_bar(pct)} {pct:3.0f}%{RESET}{tail}"
+        return f"{label} N/A{tail}"
+    return f"{label} {color_for(pct)}{pct:.0f}%{mark_for(pct)}{RESET}{tail}"
 
 
 def format_reset(ts: object, weekly: bool = False) -> str | None:

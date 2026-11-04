@@ -595,7 +595,7 @@ def render() -> str:
     if cwd_section:
         sections.append(cwd_section)
     # 週枠は届いているのに 5h 枠が無い＝5時間制限そのものが無いプラン
-    # （認証済み Ultra。2026-10-30〜）なので、5h 区画ごと出さない。
+    # （アカウント確認済みの Ultra。2026-10-30〜）なので、5h 区画ごと出さない。
     # 両方とも無いとき（prepaid 組織・初回応答前）は従来どおり両方 N/A を出す。
     if rl_5h or not rl_7d:
         sections.append(format_section("5h枠", num(rl_5h.get("used_percentage")),

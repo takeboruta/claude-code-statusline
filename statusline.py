@@ -363,6 +363,7 @@ def parse_plan(path: str) -> str | None:
     """
     ~/.claude.json の oauthAccount からサブスクプランの表示名を組み立てる。
     公式ドキュメントに無いフィールドなので、構造・型が想定と違ったら None
+    planDisplayName（例: "Ultra"）を優先し、無ければ枠区分から組み立てる
     （例: organizationRateLimitTier="default_claude_max_20x" → "Max 20x"）。
     """
     try:
@@ -373,6 +374,11 @@ def parse_plan(path: str) -> str | None:
     acct = cfg.get("oauthAccount") if isinstance(cfg, dict) else None
     if not isinstance(acct, dict):
         return None
+    # 表示名が取れればそれを使う。枠区分（tier）は改称に追従しない
+    # （2026-10-30 に Max 20x が Ultra に改称されても default_claude_max_20x のまま）。
+    display = acct.get("planDisplayName")
+    if isinstance(display, str) and display.strip():
+        return display.strip()
     tier = acct.get("organizationRateLimitTier") or acct.get("userRateLimitTier")
     if isinstance(tier, str):
         m = re.search(r"(pro|max)(?:_(\d+)x)?", tier)
@@ -393,7 +399,8 @@ def plan_name() -> str | None:
     """
     src = os.path.expanduser("~/.claude.json")
     try:
-        src_mtime = str(int(os.stat(src).st_mtime))
+        # 先頭の版は parse_plan の解釈を変えたら上げる（mtime が同じ旧キャッシュを捨てるため）
+        src_mtime = f"v2:{int(os.stat(src).st_mtime)}"
     except OSError:
         return None
     try:
@@ -587,12 +594,14 @@ def render() -> str:
     cwd_section = format_dir(data)
     if cwd_section:
         sections.append(cwd_section)
-    sections += [
-        format_section("5h枠", num(rl_5h.get("used_percentage")),
-                       format_reset(rl_5h.get("resets_at"))),
-        format_section("週枠", num(rl_7d.get("used_percentage")),
-                       format_reset(rl_7d.get("resets_at"), weekly=True)),
-    ]
+    # 週枠は届いているのに 5h 枠が無い＝5時間制限そのものが無いプラン
+    # （認証済み Ultra。2026-10-30〜）なので、5h 区画ごと出さない。
+    # 両方とも無いとき（prepaid 組織・初回応答前）は従来どおり両方 N/A を出す。
+    if rl_5h or not rl_7d:
+        sections.append(format_section("5h枠", num(rl_5h.get("used_percentage")),
+                                       format_reset(rl_5h.get("resets_at"))))
+    sections.append(format_section("週枠", num(rl_7d.get("used_percentage")),
+                                   format_reset(rl_7d.get("resets_at"), weekly=True)))
     codex_section = format_codex(codex_limits())
     if codex_section:
         sections.append(codex_section)

@@ -7,11 +7,12 @@ Claude Code statusLine スクリプト
   - 5h枠 / 週枠: レート制限の消費率（カラー付きバー）と「→リセット時刻」
   - サブスクプラン名 / 現在のモデル名
     / 文脈: コンテキスト窓の使用率（/以降は autocompact 発火ライン）
+    / 入/出: 出力1トークンあたりに読んだ入力側トークン（300以上で「区切りどき」、500以上で「新セッション推奨」）
     / 累計: セッションの API 料金換算参考コスト
     / ⚒N: 実行中のサブエージェント数（動いている時のみ表示）
 
 表示例:
-  ~/my-project │ 5h枠 ▓▓▓░░░░░ 42% → 16:00 │ 週枠 ▓▓▓▓▓▓▓░ 86% → 7/10 │ Max 20x · Opus 4.7 · 文脈 38/60% · 累計$1.24
+  ~/my-project │ 5h枠 ▓▓▓░░░░░ 42% → 16:00 │ 週枠 ▓▓▓▓▓▓▓░ 86% → 7/10 │ Max 20x · Opus 4.7 · 文脈 38/60% · 入/出 320 区切りどき · 累計$1.24
 
 Claude Code は statusLine コマンドの stdin に毎回 JSON を渡す。本スクリプトが参照する主なフィールド:
   {
@@ -451,9 +452,108 @@ def active_agents(data: dict) -> int:
     return count
 
 
+# --- セッションの効率（入/出） ------------------------------------------------
+# 出力1トークンを得るために読んだ入力側（入力＋キャッシュ書き＋キャッシュ読み）のトークン数。
+# 長い会話を引っ張るほど1回あたりの文脈が膨らみ、この値が上がる（枠を早く食う）。
+# 作者の直近30日の実測（2026-11-18）: 全体 245、長い会話で使う Opus 5.5 が 291、主に短い文脈のサブエージェントで使う Sonnet 5.5 が 104。
+# 同じ応答が記録に複数行残るので、message.id で重複を除いて数える。
+#
+# 速度の制約: statusLine は5秒ごとに呼ばれ、transcript は 10MB を超える。
+# 読んだ位置（バイト）と途中の合計をセッションごとにキャッシュし、増えた分だけ読む。
+EFF_CACHE_DIR = os.path.expanduser("~/.claude/statusline-eff")
+
+
+def _env_threshold(name: str, default: float) -> float:
+    """しきい値の環境変数を読む。空・数値でない・0以下・NaN/Inf は既定値に戻す（import 時に落とさない）。"""
+    try:
+        v = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return v if 0 < v < float("inf") else default
+
+
+EFF_WARN = _env_threshold("STATUSLINE_EFF_WARN", 300.0)
+EFF_ALERT = _env_threshold("STATUSLINE_EFF_ALERT", 500.0)
+EFF_MIN_OUTPUT = 2000   # 出力がこれ未満のうちは比が暴れるので出さない
+EFF_KEEP_IDS = 200      # 重複除去用に覚えておく直近の message.id の数
+
+
+def session_read_per_output(data: dict) -> float | None:
+    """今のセッションの「入/出」を返す。読めない・出力が少ないときは None。"""
+    tp = data.get("transcript_path")
+    if not isinstance(tp, str) or not tp:
+        return None
+    key = re.sub(r"[^\w-]", "", os.path.basename(tp))[:80] or "session"
+    cache = os.path.join(EFF_CACHE_DIR, key + ".json")
+    st = {"offset": 0, "ctx": 0, "out": 0, "ids": []}
+    try:
+        with open(cache, encoding="utf-8") as fh:
+            got = json.load(fh)
+        # 壊れたキャッシュ（型や範囲が違う）は捨てて最初から数え直す
+        if (isinstance(got, dict)
+                and all(type(got.get(k)) is int and got[k] >= 0 for k in ("offset", "ctx", "out"))
+                and isinstance(got.get("ids"), list)
+                and all(isinstance(i, str) for i in got["ids"])):
+            st = {k: got[k] for k in ("offset", "ctx", "out", "ids")}
+    except (OSError, ValueError):
+        pass
+    try:
+        fst = os.stat(tp)
+        if not stat.S_ISREG(fst.st_mode):   # FIFO 等を open すると書き手待ちで固まる
+            return None
+        size = fst.st_size
+        if size < st["offset"]:          # 作り直された等で縮んだら最初から
+            st = {"offset": 0, "ctx": 0, "out": 0, "ids": []}
+        if size > st["offset"]:
+            ids = list(st["ids"])
+            seen = set(ids)
+            with open(tp, "rb") as fh:
+                fh.seek(st["offset"])
+                chunk = fh.read()
+            end = chunk.rfind(b"\n") + 1   # 書きかけの最終行は次回に回す
+            for raw in chunk[:end].splitlines():
+                if b'"assistant"' not in raw or b'"usage"' not in raw:
+                    continue
+                try:
+                    r = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict):
+                    continue
+                msg = r.get("message")
+                if r.get("type") != "assistant" or not isinstance(msg, dict):
+                    continue
+                u = msg.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                mid = msg.get("id")
+                if isinstance(mid, str) and mid:
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    ids.append(mid)
+                st["ctx"] += sum(v for v in (u.get("input_tokens"), u.get("cache_creation_input_tokens"),
+                                             u.get("cache_read_input_tokens")) if isinstance(v, int))
+                out = u.get("output_tokens")
+                st["out"] += out if isinstance(out, int) else 0
+            st["offset"] += end
+            st["ids"] = ids[-EFF_KEEP_IDS:]
+            os.makedirs(EFF_CACHE_DIR, exist_ok=True)
+            # session-split.py（UserPromptSubmit hook）も同じキャッシュを書くので、置き換えで書く
+            tmp = f"{cache}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(st, fh)
+            os.replace(tmp, cache)
+    except OSError:
+        return None
+    if st["out"] < EFF_MIN_OUTPUT:
+        return None
+    return st["ctx"] / st["out"]
+
+
 def format_meta(data: dict) -> str | None:
     """
-    右側の付加情報「プラン · モデル名 · 文脈 NN/60% · 累計$x.xx」を組み立てる。
+    右側の付加情報「プラン · モデル名 · 文脈 NN/60% · 入/出 NNN · 累計$x.xx」を組み立てる。
     取得できた項目だけを " · " で連結し、何も無ければ None。
     """
     parts: list[str] = []
@@ -480,6 +580,17 @@ def format_meta(data: dict) -> str | None:
             parts.append(f"文脈 {color}{pct_ctx:3.0f}{RESET}/{limit:.0f}%")
         else:
             parts.append(f"文脈 {color_for(pct_ctx)}{pct_ctx:3.0f}%{RESET}")
+
+    # セッションの効率（出力1トークンあたりに読んだ入力側トークン。小さいほど良い）
+    # 数字だけだと「高いのか・何をすればいいのか」が読めないので、閾値を超えたら次の一手を添える
+    ratio = session_read_per_output(data)
+    if ratio is not None:
+        if ratio >= EFF_ALERT:
+            parts.append(f"入/出 \033[31m{ratio:,.0f} 新セッション推奨{RESET}")
+        elif ratio >= EFF_WARN:
+            parts.append(f"入/出 \033[33m{ratio:,.0f} 区切りどき{RESET}")
+        else:
+            parts.append(f"入/出 {ratio:,.0f}")
 
     # セッション累計コスト（サブスク利用時は API 換算の参考値）
     cost_obj = data.get("cost")

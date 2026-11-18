@@ -93,5 +93,80 @@ class TestRateLimitSections(unittest.TestCase):
         self.assertIn("週枠 N/A", out)
 
 
+
+def _assistant(mid, ctx, out):
+    return json.dumps({"type": "assistant", "message": {"id": mid, "usage": {
+        "input_tokens": ctx, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "output_tokens": out}}})
+
+
+class TestSessionReadPerOutput(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tp = os.path.join(self.tmp.name, "session.jsonl")
+        p = mock.patch.object(statusline, "EFF_CACHE_DIR", os.path.join(self.tmp.name, "eff"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write(self, lines, mode="w"):
+        with open(self.tp, mode, encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in lines))
+
+    def _ratio(self):
+        return statusline.session_read_per_output({"transcript_path": self.tp})
+
+    def test_出力が少ないうちは出さない(self):
+        self._write([_assistant("a", 100_000, 500)])
+        self.assertIsNone(self._ratio())
+
+    def test_入力側の合計を出力で割る(self):
+        self._write([_assistant("a", 300_000, 1000), _assistant("b", 500_000, 1000)])
+        self.assertEqual(self._ratio(), 400)
+
+    def test_同じmessage_idは1回だけ数える(self):
+        self._write([_assistant("a", 400_000, 2000), _assistant("a", 400_000, 2000)])
+        self.assertEqual(self._ratio(), 200)
+
+    def test_増えた分だけ読み足す(self):
+        self._write([_assistant("a", 400_000, 2000)])
+        self.assertEqual(self._ratio(), 200)
+        self._write([_assistant("b", 800_000, 2000)], mode="a")
+        self.assertEqual(self._ratio(), 300)
+
+    def test_書きかけの最終行は次回に回す(self):
+        self._write([_assistant("a", 400_000, 2000)])
+        with open(self.tp, "a", encoding="utf-8") as f:
+            f.write(_assistant("b", 800_000, 2000)[:40])
+        self.assertEqual(self._ratio(), 200)
+
+    def test_ファイルが無ければNone(self):
+        self.assertIsNone(statusline.session_read_per_output({"transcript_path": self.tp + ".none"}))
+        self.assertIsNone(statusline.session_read_per_output({}))
+
+    def test_壊れたキャッシュは捨てて数え直す(self):
+        self._write([_assistant("a", 400_000, 2000)])
+        os.makedirs(statusline.EFF_CACHE_DIR)
+        with open(os.path.join(statusline.EFF_CACHE_DIR, "sessionjsonl.json"), "w") as f:
+            f.write('{"offset": null, "ctx": "x", "out": 1, "ids": 3}')
+        self.assertEqual(self._ratio(), 200)
+
+    def test_辞書でない行は読み飛ばす(self):
+        self._write(['["assistant","usage"]', '"assistant usage"', _assistant("a", 400_000, 2000)])
+        self.assertEqual(self._ratio(), 200)
+
+    def test_しきい値の環境変数が不正なら既定値(self):
+        for bad in ("", "abc", "nan", "inf", "0", "-5"):
+            with mock.patch.dict(os.environ, {"STATUSLINE_EFF_WARN": bad}):
+                self.assertEqual(statusline._env_threshold("STATUSLINE_EFF_WARN", 300.0), 300.0)
+        with mock.patch.dict(os.environ, {"STATUSLINE_EFF_WARN": "250"}):
+            self.assertEqual(statusline._env_threshold("STATUSLINE_EFF_WARN", 300.0), 250.0)
+
+    def test_閾値を超えたら次の一手を添える(self):
+        self._write([_assistant("a", 640_000, 2000)])
+        with mock.patch.object(statusline, "plan_name", return_value=None):
+            meta = statusline.format_meta({"transcript_path": self.tp})
+        self.assertIn("320 区切りどき", meta)
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ Claude Code statusLine スクリプト
   - サブスクプラン名 / 現在のモデル名
     / 文脈: コンテキスト窓の使用率（/以降は autocompact 発火ライン）
     / 入/出: 出力1トークンあたりに読んだ入力側トークン（300以上で「区切りどき」、500以上で「新セッション推奨」）
+      サブエージェントを使ったセッションでは、その分も足した値を「(サブ込みN)」で並べる
     / 累計: セッションの API 料金換算参考コスト
     / ⚒N: 実行中のサブエージェント数（動いている時のみ表示）
 
@@ -478,77 +479,159 @@ EFF_MIN_OUTPUT = 2000   # 出力がこれ未満のうちは比が暴れるので
 EFF_KEEP_IDS = 200      # 重複除去用に覚えておく直近の message.id の数
 
 
-def session_read_per_output(data: dict) -> float | None:
-    """今のセッションの「入/出」を返す。読めない・出力が少ないときは None。"""
+def _eff_new() -> dict:
+    return {"offset": 0, "ctx": 0, "out": 0, "ids": []}
+
+
+def _eff_valid(got: object) -> bool:
+    """キャッシュに入っていた1ファイル分の状態が使える形か（型や範囲が違えば捨てて数え直す）。"""
+    return (isinstance(got, dict)
+            and all(type(got.get(k)) is int and got[k] >= 0 for k in ("offset", "ctx", "out"))
+            and isinstance(got.get("ids"), list)
+            and all(isinstance(i, str) for i in got["ids"]))
+
+
+def _eff_advance(path: str, st: dict) -> tuple[dict, bool]:
+    """transcript 1本を、前回読んだ位置から読み足す。返り値は（新しい状態, 変わったか）。読めなければ OSError。"""
+    fst = os.stat(path)
+    if not stat.S_ISREG(fst.st_mode):   # FIFO 等を open すると書き手待ちで固まる
+        raise OSError("not a regular file")
+    size = fst.st_size
+    changed = False
+    if size < st["offset"]:          # 作り直された等で縮んだら最初から
+        st, changed = _eff_new(), True
+    if size <= st["offset"]:
+        return st, changed
+    ids = list(st["ids"])
+    seen = set(ids)
+    ctx, out = st["ctx"], st["out"]
+    with open(path, "rb") as fh:
+        fh.seek(st["offset"])
+        chunk = fh.read()
+    end = chunk.rfind(b"\n") + 1   # 書きかけの最終行は次回に回す
+    if not end:
+        return st, changed
+    for raw in chunk[:end].splitlines():
+        if b'"assistant"' not in raw or b'"usage"' not in raw:
+            continue
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        msg = r.get("message")
+        if r.get("type") != "assistant" or not isinstance(msg, dict):
+            continue
+        u = msg.get("usage")
+        if not isinstance(u, dict):
+            continue
+        mid = msg.get("id")
+        if isinstance(mid, str) and mid:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            ids.append(mid)
+        ctx += sum(v for v in (u.get("input_tokens"), u.get("cache_creation_input_tokens"),
+                               u.get("cache_read_input_tokens")) if isinstance(v, int))
+        o = u.get("output_tokens")
+        out += o if isinstance(o, int) else 0
+    return {"offset": st["offset"] + end, "ctx": ctx, "out": out, "ids": ids[-EFF_KEEP_IDS:]}, True
+
+
+def _eff_load(cache: str) -> object:
+    try:
+        with open(cache, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _eff_save(cache: str, obj: object) -> None:
+    """session-split.py（UserPromptSubmit hook）も同じキャッシュを書くので、置き換えで書く。"""
+    os.makedirs(EFF_CACHE_DIR, exist_ok=True)
+    tmp = f"{cache}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh)
+    os.replace(tmp, cache)
+
+
+def _eff_key(tp: str) -> str:
+    return re.sub(r"[^\w-]", "", os.path.basename(tp))[:80] or "session"
+
+
+def _eff_main(data: dict) -> dict | None:
+    """メインの transcript の合計（ctx / out）を返す。読めなければ None。"""
     tp = data.get("transcript_path")
     if not isinstance(tp, str) or not tp:
         return None
-    key = re.sub(r"[^\w-]", "", os.path.basename(tp))[:80] or "session"
-    cache = os.path.join(EFF_CACHE_DIR, key + ".json")
-    st = {"offset": 0, "ctx": 0, "out": 0, "ids": []}
+    cache = os.path.join(EFF_CACHE_DIR, _eff_key(tp) + ".json")
+    got = _eff_load(cache)
+    st = {k: got[k] for k in ("offset", "ctx", "out", "ids")} if _eff_valid(got) else _eff_new()
     try:
-        with open(cache, encoding="utf-8") as fh:
-            got = json.load(fh)
-        # 壊れたキャッシュ（型や範囲が違う）は捨てて最初から数え直す
-        if (isinstance(got, dict)
-                and all(type(got.get(k)) is int and got[k] >= 0 for k in ("offset", "ctx", "out"))
-                and isinstance(got.get("ids"), list)
-                and all(isinstance(i, str) for i in got["ids"])):
-            st = {k: got[k] for k in ("offset", "ctx", "out", "ids")}
-    except (OSError, ValueError):
-        pass
-    try:
-        fst = os.stat(tp)
-        if not stat.S_ISREG(fst.st_mode):   # FIFO 等を open すると書き手待ちで固まる
-            return None
-        size = fst.st_size
-        if size < st["offset"]:          # 作り直された等で縮んだら最初から
-            st = {"offset": 0, "ctx": 0, "out": 0, "ids": []}
-        if size > st["offset"]:
-            ids = list(st["ids"])
-            seen = set(ids)
-            with open(tp, "rb") as fh:
-                fh.seek(st["offset"])
-                chunk = fh.read()
-            end = chunk.rfind(b"\n") + 1   # 書きかけの最終行は次回に回す
-            for raw in chunk[:end].splitlines():
-                if b'"assistant"' not in raw or b'"usage"' not in raw:
-                    continue
-                try:
-                    r = json.loads(raw)
-                except ValueError:
-                    continue
-                if not isinstance(r, dict):
-                    continue
-                msg = r.get("message")
-                if r.get("type") != "assistant" or not isinstance(msg, dict):
-                    continue
-                u = msg.get("usage")
-                if not isinstance(u, dict):
-                    continue
-                mid = msg.get("id")
-                if isinstance(mid, str) and mid:
-                    if mid in seen:
-                        continue
-                    seen.add(mid)
-                    ids.append(mid)
-                st["ctx"] += sum(v for v in (u.get("input_tokens"), u.get("cache_creation_input_tokens"),
-                                             u.get("cache_read_input_tokens")) if isinstance(v, int))
-                out = u.get("output_tokens")
-                st["out"] += out if isinstance(out, int) else 0
-            st["offset"] += end
-            st["ids"] = ids[-EFF_KEEP_IDS:]
-            os.makedirs(EFF_CACHE_DIR, exist_ok=True)
-            # session-split.py（UserPromptSubmit hook）も同じキャッシュを書くので、置き換えで書く
-            tmp = f"{cache}.{os.getpid()}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(st, fh)
-            os.replace(tmp, cache)
+        st, changed = _eff_advance(tp, st)
+        if changed:
+            _eff_save(cache, st)
     except OSError:
         return None
-    if st["out"] < EFF_MIN_OUTPUT:
+    return st
+
+
+def session_read_per_output(data: dict) -> float | None:
+    """今のセッションの「入/出」（メインだけ）を返す。読めない・出力が少ないときは None。"""
+    st = _eff_main(data)
+    if st is None or st["out"] < EFF_MIN_OUTPUT:
         return None
     return st["ctx"] / st["out"]
+
+
+def session_combined_per_output(data: dict) -> float | None:
+    """
+    サブエージェントの分も足した「入/出」を返す。サブエージェントの出力が無ければ None。
+
+    仕事をサブエージェントに出しても、メインに溜まった文脈は減らない（読み直され続け、出力だけが
+    サブ側へ移る）ので、メインの値は下がりにくい。出した効果が見えるよう、こちらの値を並べて見せる。
+    実測 2026-11-18（直近30日・応答150〜400のセッション）: サブの出力が2割以上の4件は
+    メイン 228 / サブ込み 155、サブ無しの15件は 228。件数が少ないので傾向の参考。
+    """
+    main = _eff_main(data)
+    if main is None or main["out"] < EFF_MIN_OUTPUT:
+        return None
+    tp = data["transcript_path"]
+    if not tp.endswith(".jsonl"):
+        return None
+    sub_dir = os.path.join(tp[: -len(".jsonl")], "subagents")
+    cache = os.path.join(EFF_CACHE_DIR, _eff_key(tp) + ".subs.json")
+    got = _eff_load(cache)
+    subs = {k: v for k, v in got.items() if _eff_valid(v)} if isinstance(got, dict) else {}
+    dirty = False
+    try:
+        with os.scandir(sub_dir) as entries:
+            names = sorted(e.name for e in entries
+                           if e.name.startswith("agent-") and e.name.endswith(".jsonl"))
+    except OSError:
+        return None
+    if set(subs) - set(names):       # 消えた・名前の変わったファイルの分は合計から外す
+        subs = {k: v for k, v in subs.items() if k in names}
+        dirty = True
+    for name in names:
+        try:
+            st, changed = _eff_advance(os.path.join(sub_dir, name), subs.get(name) or _eff_new())
+        except OSError:
+            continue
+        if changed or name not in subs:
+            subs[name] = st
+            dirty = True
+    if dirty:
+        try:
+            _eff_save(cache, subs)
+        except OSError:
+            pass
+    sub_ctx = sum(v["ctx"] for v in subs.values())
+    sub_out = sum(v["out"] for v in subs.values())
+    if sub_out <= 0:
+        return None
+    return (main["ctx"] + sub_ctx) / (main["out"] + sub_out)
 
 
 def format_meta(data: dict) -> str | None:
@@ -585,12 +668,15 @@ def format_meta(data: dict) -> str | None:
     # 数字だけだと「高いのか・何をすればいいのか」が読めないので、閾値を超えたら次の一手を添える
     ratio = session_read_per_output(data)
     if ratio is not None:
+        # サブエージェントに出した分の効果はメインの値に出にくいので、サブ込みの値を括弧で並べる
+        comb = session_combined_per_output(data)
+        both = f"{ratio:,.0f}" + (f"(サブ込み{comb:,.0f})" if comb is not None else "")
         if ratio >= EFF_ALERT:
-            parts.append(f"入/出 \033[31m{ratio:,.0f} 新セッション推奨{RESET}")
+            parts.append(f"入/出 \033[31m{both} 新セッション推奨{RESET}")
         elif ratio >= EFF_WARN:
-            parts.append(f"入/出 \033[33m{ratio:,.0f} 区切りどき{RESET}")
+            parts.append(f"入/出 \033[33m{both} 区切りどき{RESET}")
         else:
-            parts.append(f"入/出 {ratio:,.0f}")
+            parts.append(f"入/出 {both}")
 
     # セッション累計コスト（サブスク利用時は API 換算の参考値）
     cost_obj = data.get("cost")

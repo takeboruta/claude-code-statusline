@@ -162,6 +162,56 @@ class TestSessionReadPerOutput(unittest.TestCase):
         with mock.patch.dict(os.environ, {"STATUSLINE_EFF_WARN": "250"}):
             self.assertEqual(statusline._env_threshold("STATUSLINE_EFF_WARN", 300.0), 250.0)
 
+    def _wsub(self, name, lines, mode="w"):
+        path = os.path.join(self.tmp.name, "session", "subagents", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, mode, encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in lines))
+        return path
+
+    @property
+    def data(self):
+        return {"transcript_path": self.tp}
+
+    def _meta(self):
+        with mock.patch.object(statusline, "plan_name", return_value=None):
+            return statusline.format_meta(self.data)
+
+    def test_サブエージェントが無ければサブ込みは出さない(self):
+        self._write([_assistant("a", 640_000, 2000)])
+        self.assertIsNone(statusline.session_combined_per_output(self.data))
+        self.assertIn("入/出 \033[33m320 区切りどき", self._meta())
+
+    def test_サブ込みはメインとサブを足して割る(self):
+        self._write([_assistant("a", 640_000, 2000)])
+        self._wsub("agent-1.jsonl", [_assistant("s1", 100_000, 1000)])
+        self._wsub("agent-2.jsonl", [_assistant("s2", 160_000, 1000)])
+        self._wsub("other.jsonl", [_assistant("x", 9_000_000, 1)])
+        self.assertEqual(statusline.session_combined_per_output(self.data), 225)
+        self.assertIn("320(サブ込み225) 区切りどき", self._meta())
+        # サブが進んだら読み足す。メインの値は変わらない
+        self._wsub("agent-2.jsonl", [_assistant("s3", 100_000, 1000)], mode="a")
+        self.assertEqual(statusline.session_combined_per_output(self.data), 200)
+        self.assertEqual(statusline.session_read_per_output(self.data), 320)
+
+    def test_消えたサブエージェントの分は合計から外す(self):
+        self._write([_assistant("a", 640_000, 2000)])
+        self._wsub("agent-1.jsonl", [_assistant("s1", 100_000, 1000)])
+        self._wsub("agent-2.jsonl", [_assistant("s2", 160_000, 1000)])
+        self.assertEqual(statusline.session_combined_per_output(self.data), 225)
+        os.remove(os.path.join(self.tmp.name, "session", "subagents", "agent-2.jsonl"))
+        self.assertEqual(statusline.session_combined_per_output(self.data), 740_000 / 3000)
+        os.remove(os.path.join(self.tmp.name, "session", "subagents", "agent-1.jsonl"))
+        self.assertIsNone(statusline.session_combined_per_output(self.data))
+
+    def test_サブのキャッシュが壊れていても数え直す(self):
+        self._write([_assistant("a", 640_000, 2000)])
+        self._wsub("agent-1.jsonl", [_assistant("s1", 260_000, 2000)])
+        os.makedirs(statusline.EFF_CACHE_DIR)
+        with open(os.path.join(statusline.EFF_CACHE_DIR, "sessionjsonl.subs.json"), "w") as f:
+            f.write('{"agent-1.jsonl": {"offset": -1}, "x": 3}')
+        self.assertEqual(statusline.session_combined_per_output(self.data), 225)
+
     def test_閾値を超えたら次の一手を添える(self):
         self._write([_assistant("a", 640_000, 2000)])
         with mock.patch.object(statusline, "plan_name", return_value=None):
